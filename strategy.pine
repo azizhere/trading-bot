@@ -1,0 +1,159 @@
+//@version=5
+// ================================================================
+// SUPER AGGRESSIVE PRO MAX STRATEGY
+// By: Claude AI + Multi-Indicator Confluence
+// Use: 15min chart pe lagao (crypto/stocks dono ke liye)
+// ================================================================
+
+strategy(
+  "Super Aggressive Pro Max Bot 🔥", 
+  overlay=true, 
+  default_qty_type=strategy.percent_of_equity,
+  default_qty_value=10,
+  commission_type=strategy.commission.percent,
+  commission_value=0.1,
+  slippage=2
+)
+
+// ================================================================
+// SETTINGS
+// ================================================================
+grp1 = "Moving Averages"
+ema_fast   = input.int(8,  "Fast EMA",  group=grp1)
+ema_mid    = input.int(21, "Mid EMA",   group=grp1)
+ema_slow   = input.int(55, "Slow EMA",  group=grp1)
+
+grp2 = "Oscillators"
+rsi_len    = input.int(14, "RSI Length",     group=grp2)
+rsi_ob     = input.int(70, "RSI Overbought", group=grp2)
+rsi_os     = input.int(30, "RSI Oversold",   group=grp2)
+
+grp3 = "MACD"
+macd_fast  = input.int(12, "MACD Fast", group=grp3)
+macd_slow  = input.int(26, "MACD Slow", group=grp3)
+macd_sig   = input.int(9,  "MACD Signal", group=grp3)
+
+grp4 = "Volume & ATR"
+vol_mult   = input.float(1.5, "Volume Multiplier", group=grp4)
+atr_len    = input.int(14, "ATR Length", group=grp4)
+
+// ================================================================
+// INDICATORS
+// ================================================================
+
+// EMAs
+ema8  = ta.ema(close, ema_fast)
+ema21 = ta.ema(close, ema_mid)
+ema55 = ta.ema(close, ema_slow)
+
+// RSI
+rsi = ta.rsi(close, rsi_len)
+
+// MACD
+[macd_line, signal_line, hist] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+macd_cross_up   = ta.crossover(macd_line, signal_line)
+macd_cross_down = ta.crossunder(macd_line, signal_line)
+
+// Volume Analysis
+vol_avg = ta.sma(volume, 20)
+high_volume = volume > vol_avg * vol_mult
+
+// ATR for volatility
+atr = ta.atr(atr_len)
+
+// Trend Direction
+uptrend   = ema8 > ema21 and ema21 > ema55
+downtrend = ema8 < ema21 and ema21 < ema55
+
+// Price vs EMAs
+above_all_emas = close > ema8 and close > ema21 and close > ema55
+below_all_emas = close < ema8 and close < ema21 and close < ema55
+
+// Momentum
+bullish_momentum = rsi > 50 and rsi < rsi_ob
+bearish_momentum = rsi < 50 and rsi > rsi_os
+
+// ================================================================
+// SIGNAL CONDITIONS - MULTI-CONFLUENCE
+// ================================================================
+
+// STRONG BUY: 4 conditions must align
+strong_buy = (
+  ta.crossover(ema8, ema21) and   // EMA crossover
+  uptrend and                      // Trend aligned
+  macd_cross_up and                // MACD confirms
+  high_volume and                  // Volume confirms
+  rsi < rsi_ob                     // Not overbought
+)
+
+// STRONG SELL: 4 conditions must align  
+strong_sell = (
+  ta.crossunder(ema8, ema21) and  // EMA crossover
+  downtrend and                    // Trend aligned
+  macd_cross_down and              // MACD confirms
+  high_volume and                  // Volume confirms
+  rsi > rsi_os                     // Not oversold
+)
+
+// ================================================================
+// STRATEGY ENTRIES
+// ================================================================
+if strong_buy
+    strategy.entry("LONG 🚀", strategy.long)
+    strategy.exit("LONG EXIT", "LONG 🚀",
+      stop=close - atr * 2,
+      limit=close + atr * 6)
+
+if strong_sell
+    strategy.entry("SHORT 📉", strategy.short)
+    strategy.exit("SHORT EXIT", "SHORT 📉",
+      stop=close + atr * 2,
+      limit=close - atr * 6)
+
+// ================================================================
+// PLOTS
+// ================================================================
+plot(ema8,  color=color.new(color.yellow, 0), linewidth=1, title="EMA 8")
+plot(ema21, color=color.new(color.blue, 0),   linewidth=2, title="EMA 21")
+plot(ema55, color=color.new(color.red, 0),    linewidth=2, title="EMA 55")
+
+// Signal markers
+plotshape(strong_buy,  style=shape.triangleup,   location=location.belowbar, color=color.lime,  size=size.normal, title="BUY")
+plotshape(strong_sell, style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.normal, title="SELL")
+
+// Background color
+bgcolor(uptrend   ? color.new(color.green, 93) : na, title="Uptrend BG")
+bgcolor(downtrend ? color.new(color.red, 93)   : na, title="Downtrend BG")
+
+// ================================================================
+// ALERTS - JSON format jo webhook ko jayega
+// ================================================================
+if strong_buy
+    alert(
+      '{"action":"buy","symbol":"' + syminfo.ticker + 
+      '","price":"' + str.tostring(close) + 
+      '","rsi":"' + str.tostring(math.round(rsi, 1)) +
+      '","macd":"' + str.tostring(math.round(macd_line, 4)) +
+      '","volume":"' + str.tostring(volume) +
+      '","trend":"uptrend' +
+      '","strategy":"SuperAggressiveProMax' +
+      '","timeframe":"' + timeframe.period +
+      '","strength":"STRONG' +
+      '","time":"' + str.tostring(timenow) + '"}',
+      alert.freq_once_per_bar
+    )
+
+if strong_sell
+    alert(
+      '{"action":"sell","symbol":"' + syminfo.ticker + 
+      '","price":"' + str.tostring(close) + 
+      '","rsi":"' + str.tostring(math.round(rsi, 1)) +
+      '","macd":"' + str.tostring(math.round(macd_line, 4)) +
+      '","volume":"' + str.tostring(volume) +
+      '","trend":"downtrend' +
+      '","strategy":"SuperAggressiveProMax' +
+      '","timeframe":"' + timeframe.period +
+      '","strength":"STRONG' +
+      '","time":"' + str.tostring(timenow) + '"}',
+      alert.freq_once_per_bar
+    )

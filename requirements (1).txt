@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+alpaca-trade-api
+anthropic
+python-dotenv
+requests
