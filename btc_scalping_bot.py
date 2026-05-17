@@ -1,18 +1,8 @@
 """
 ================================================================
-BTC SCALPING BOT - ULTRA AGGRESSIVE
-================================================================
-Strategies used:
-1. EMA 3/8 Crossover (fast scalping)
-2. RSI Divergence (momentum)
-3. Bollinger Bands (breakout)
-4. Volume Spike (confirmation)
-5. VWAP (price direction)
-
-Har 1 minute mein check karta hai
-Target: 0.3-0.8% per trade
-Stop Loss: 0.2%
-Risk:Reward = 1:3
+BTC SCALPING BOT - ULTRA AGGRESSIVE (FIXED)
+Alpaca API use karta hai — price aur trading dono
+CoinGecko fallback bhi hai
 ================================================================
 """
 
@@ -24,340 +14,224 @@ import statistics
 from datetime import datetime
 from collections import deque
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
 # ================================================================
 # SETTINGS
 # ================================================================
-BOT_URL        = os.getenv("BOT_URL", "https://trading-bot-1-7hab.onrender.com")
-BOT_SECRET     = os.getenv("WEBHOOK_SECRET", "MeraBotSecret123")
-SYMBOL         = "BTCUSD"
-CHECK_SECONDS  = 60       # Har 1 minute mein check
-MIN_CONFIDENCE = 2        # Minimum 2 strategies agree karein
+BOT_URL         = os.getenv("BOT_URL",          "https://trading-bot-1-7hab.onrender.com")
+BOT_SECRET      = os.getenv("WEBHOOK_SECRET",    "MeraBotSecret123")
+ALPACA_KEY      = os.getenv("ALPACA_API_KEY",    "")
+ALPACA_SECRET   = os.getenv("ALPACA_SECRET_KEY", "")
 
-# Scalping targets
-STOP_LOSS_PCT  = 0.002    # 0.2% stop loss
-TAKE_PROFIT_PCT= 0.006    # 0.6% take profit (3:1 RR)
+SYMBOL          = "BTCUSD"
+CHECK_SECONDS   = 60
+MIN_CONFIDENCE  = 2
+STOP_LOSS_PCT   = 0.002
+TAKE_PROFIT_PCT = 0.006
+COOLDOWN        = 300
 
-# ================================================================
-# DATA STORAGE
-# ================================================================
-prices  = deque(maxlen=100)   # Last 100 prices
-volumes = deque(maxlen=100)   # Last 100 volumes
-highs   = deque(maxlen=20)
-lows    = deque(maxlen=20)
-
-trade_stats = {
-    "total_signals": 0,
-    "buy_signals": 0,
-    "sell_signals": 0,
-    "last_signal": None,
-    "last_signal_time": None,
-    "start_time": datetime.now().isoformat()
-}
+prices = deque(maxlen=100)
+trade_stats = {"total":0,"buys":0,"sells":0,"last_signal":None,"last_time":0}
 
 # ================================================================
-# LIVE DATA — Binance free API (most accurate for BTC)
+# PRICE — Alpaca first, CoinGecko fallback
 # ================================================================
-def get_btc_data():
-    """Binance se live BTC OHLCV data lo — bilkul free"""
-    try:
-        # 1 minute candles
-        url = "https://api.binance.com/api/v3/klines"
-        params = {
-            "symbol": "BTCUSDT",
-            "interval": "1m",
-            "limit": 50
-        }
-        res = requests.get(url, params=params, timeout=10)
-        candles = res.json()
-
-        if not candles or isinstance(candles, dict):
-            raise Exception("Bad response")
-
-        ohlcv = []
-        for c in candles:
-            ohlcv.append({
-                "open":   float(c[1]),
-                "high":   float(c[2]),
-                "low":    float(c[3]),
-                "close":  float(c[4]),
-                "volume": float(c[5])
-            })
-
-        return ohlcv
-
-    except Exception as e:
-        logger.error(f"Binance error: {e}")
-        # Fallback — CoinGecko
+def get_btc_price():
+    # Try Alpaca first
+    if ALPACA_KEY and ALPACA_SECRET:
         try:
-            url = "https://api.coingecko.com/api/v3/simple/price"
-            params = {"ids": "bitcoin", "vs_currencies": "usd"}
-            res = requests.get(url, params=params, timeout=10)
-            price = float(res.json()["bitcoin"]["usd"])
-            return [{"open": price, "high": price, "low": price,
-                    "close": price, "volume": 100}]
-        except:
-            return None
+            url = "https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes"
+            headers = {
+                "APCA-API-KEY-ID": ALPACA_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET
+            }
+            res  = requests.get(url, headers=headers, params={"symbols":"BTC/USD"}, timeout=15)
+            data = res.json()
+            quote = data["quotes"]["BTC/USD"]
+            price = (float(quote["bp"]) + float(quote["ap"])) / 2
+            logger.info(f"BTC (Alpaca): ${price:,.2f}")
+            return round(price, 2)
+        except Exception as e:
+            logger.warning(f"Alpaca price failed: {e} — CoinGecko try kar raha hoon")
+
+    # Fallback CoinGecko
+    try:
+        res   = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids":"bitcoin","vs_currencies":"usd"},
+            timeout=15
+        )
+        price = float(res.json()["bitcoin"]["usd"])
+        logger.info(f"BTC (CoinGecko): ${price:,.2f}")
+        return price
+    except Exception as e:
+        logger.error(f"Price error: {e}")
+        return None
 
 # ================================================================
-# TECHNICAL INDICATORS
+# INDICATORS
 # ================================================================
-def ema(data, period):
+def calc_ema(data, period):
+    data = list(data)
     if len(data) < period:
         return data[-1] if data else 0
-    mult = 2 / (period + 1)
-    result = sum(data[:period]) / period
-    for val in data[period:]:
-        result = (val - result) * mult + result
-    return round(result, 2)
+    mult = 2/(period+1)
+    val  = sum(data[:period])/period
+    for p in data[period:]:
+        val = (p-val)*mult+val
+    return round(val, 2)
 
-def rsi(closes, period=14):
-    if len(closes) < period + 1:
+def calc_rsi(closes, period=7):
+    closes = list(closes)
+    if len(closes) < period+1:
         return 50
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_g = sum(gains[-period:]) / period
-    avg_l = sum(losses[-period:]) / period
-    if avg_l == 0:
-        return 100
-    return round(100 - (100 / (1 + avg_g/avg_l)), 2)
+    g,l = [],[]
+    for i in range(1,len(closes)):
+        d = closes[i]-closes[i-1]
+        g.append(max(d,0)); l.append(max(-d,0))
+    ag = sum(g[-period:])/period
+    al = sum(l[-period:])/period
+    return round(100-(100/(1+ag/al)),2) if al else 100
 
-def bollinger_bands(closes, period=20, std_mult=2.0):
+def calc_bb(closes, period=15):
+    closes = list(closes)
     if len(closes) < period:
-        mid = closes[-1]
-        return mid, mid * 1.01, mid * 0.99
-    recent = list(closes)[-period:]
-    mid = sum(recent) / period
-    std = statistics.stdev(recent)
-    return round(mid, 2), round(mid + std*std_mult, 2), round(mid - std*std_mult, 2)
+        m=closes[-1]; return m,m*1.01,m*0.99
+    r   = closes[-period:]
+    mid = sum(r)/period
+    std = statistics.stdev(r) if len(r)>1 else 0
+    return round(mid,2), round(mid+std*2,2), round(mid-std*2,2)
 
-def vwap(closes_list, volumes_list):
-    if len(closes_list) < 2:
-        return closes_list[-1] if closes_list else 0
-    tp_vol = sum(c * v for c, v in zip(closes_list, volumes_list))
-    total_vol = sum(volumes_list)
-    return round(tp_vol / total_vol, 2) if total_vol > 0 else closes_list[-1]
-
-def volume_spike(volumes_list):
-    if len(volumes_list) < 10:
-        return False
-    avg = sum(list(volumes_list)[-20:-1]) / min(19, len(volumes_list)-1)
-    latest = list(volumes_list)[-1]
-    return latest > avg * 1.5  # 50% above average
+def calc_momentum(closes, period=5):
+    closes = list(closes)
+    if len(closes) < period+1:
+        return 0
+    return round((closes[-1]-closes[-period-1])/closes[-period-1]*100, 3)
 
 # ================================================================
-# SCALPING SIGNAL ENGINE — 5 Strategies
+# SIGNAL ENGINE
 # ================================================================
-def analyze_scalp_signal(ohlcv):
-    """
-    5 strategies check karo
-    2+ agree karein toh trade karo
-    """
-    if len(ohlcv) < 22:
-        logger.info(f"Data collect ho raha hai: {len(ohlcv)}/22")
-        return None, 0, 0, []
+def analyze(price_list):
+    closes = list(price_list)
+    if len(closes) < 10:
+        logger.info(f"Data jama ho raha hai: {len(closes)}/10")
+        return "hold", 50, closes[-1] if closes else 0, []
 
-    closes  = [c["close"]  for c in ohlcv]
-    vols    = [c["volume"] for c in ohlcv]
-    highs_l = [c["high"]   for c in ohlcv]
-    lows_l  = [c["low"]    for c in ohlcv]
+    current = closes[-1]
+    buy_s, sell_s = [], []
 
-    price   = closes[-1]
-    signals = {"buy": [], "sell": []}
+    # 1. EMA 3/8
+    e3=calc_ema(closes,3); e8=calc_ema(closes,8)
+    e3p=calc_ema(closes[:-1],3); e8p=calc_ema(closes[:-1],8)
+    if e3p<=e8p and e3>e8: buy_s.append("EMA3/8 Cross UP")
+    elif e3p>=e8p and e3<e8: sell_s.append("EMA3/8 Cross DOWN")
 
-    # ── Strategy 1: EMA 3/8 Crossover (Ultra Fast Scalp) ──
-    e3      = ema(closes, 3)
-    e8      = ema(closes, 8)
-    e3_prev = ema(closes[:-1], 3)
-    e8_prev = ema(closes[:-1], 8)
+    # 2. RSI
+    rsi_val=calc_rsi(closes,7)
+    if rsi_val<35: buy_s.append(f"RSI Oversold ({rsi_val})")
+    elif rsi_val>65: sell_s.append(f"RSI Overbought ({rsi_val})")
 
-    if e3_prev <= e8_prev and e3 > e8:
-        signals["buy"].append("EMA3/8 Crossover UP")
-    elif e3_prev >= e8_prev and e3 < e8:
-        signals["sell"].append("EMA3/8 Crossover DOWN")
+    # 3. Bollinger Bands
+    _,bb_up,bb_dn=calc_bb(closes,15)
+    if current<=bb_dn*1.001: buy_s.append("BB Lower Bounce")
+    elif current>=bb_up*0.999: sell_s.append("BB Upper Reject")
 
-    # ── Strategy 2: RSI Scalp (Extreme levels) ──
-    rsi_val = rsi(closes, 7)   # Fast RSI
+    # 4. Momentum
+    mom=calc_momentum(closes,5)
+    if mom>0.15: buy_s.append(f"Momentum UP ({mom}%)")
+    elif mom<-0.15: sell_s.append(f"Momentum DOWN ({mom}%)")
 
-    if rsi_val < 35:
-        signals["buy"].append(f"RSI Oversold ({rsi_val})")
-    elif rsi_val > 65:
-        signals["sell"].append(f"RSI Overbought ({rsi_val})")
+    # 5. EMA Trend
+    e21=calc_ema(closes,21) if len(closes)>=21 else e8
+    if e8>e21 and current>e8: buy_s.append("Uptrend")
+    elif e8<e21 and current<e8: sell_s.append("Downtrend")
 
-    # ── Strategy 3: Bollinger Band Bounce ──
-    bb_mid, bb_upper, bb_lower = bollinger_bands(closes, 15)
+    logger.info(f"Price:${current:,.2f} | RSI:{rsi_val} | BB:{bb_dn:,.0f}/{bb_up:,.0f} | Mom:{mom}%")
+    logger.info(f"BUY:{len(buy_s)} signals | SELL:{len(sell_s)} signals")
 
-    if price <= bb_lower * 1.001:
-        signals["buy"].append(f"BB Lower Bounce (${bb_lower:,.0f})")
-    elif price >= bb_upper * 0.999:
-        signals["sell"].append(f"BB Upper Rejection (${bb_upper:,.0f})")
-
-    # ── Strategy 4: Volume Spike Confirmation ──
-    vol_spike = volume_spike(vols)
-    if vol_spike:
-        if e3 > e8:
-            signals["buy"].append("Volume Spike BUY")
-        else:
-            signals["sell"].append("Volume Spike SELL")
-
-    # ── Strategy 5: VWAP Direction ──
-    vwap_val = vwap(closes[-20:], vols[-20:])
-
-    if price > vwap_val * 1.0005 and e3 > e8:
-        signals["buy"].append(f"Above VWAP (${vwap_val:,.0f})")
-    elif price < vwap_val * 0.9995 and e3 < e8:
-        signals["sell"].append(f"Below VWAP (${vwap_val:,.0f})")
-
-    # ── Decision ──
-    buy_count  = len(signals["buy"])
-    sell_count = len(signals["sell"])
-
-    logger.info(f"Price: ${price:,.2f} | EMA3: ${e3:,.0f} | EMA8: ${e8:,.0f} | RSI: {rsi_val} | BB: {bb_lower:,.0f}/{bb_upper:,.0f}")
-    logger.info(f"BUY signals: {buy_count} | SELL signals: {sell_count}")
-
-    if buy_count >= MIN_CONFIDENCE and buy_count > sell_count:
-        return "buy", rsi_val, price, signals["buy"]
-    elif sell_count >= MIN_CONFIDENCE and sell_count > buy_count:
-        return "sell", rsi_val, price, signals["sell"]
-    else:
-        return "hold", rsi_val, price, []
+    if len(buy_s)>=MIN_CONFIDENCE and len(buy_s)>len(sell_s):
+        return "buy", rsi_val, current, buy_s
+    elif len(sell_s)>=MIN_CONFIDENCE and len(sell_s)>len(buy_s):
+        return "sell", rsi_val, current, sell_s
+    return "hold", rsi_val, current, []
 
 # ================================================================
-# SIGNAL SENDER
+# SEND TO BOT
 # ================================================================
 def send_signal(action, price, rsi_val, reasons):
-    """Bot ko signal bhejo"""
     try:
-        stop_loss   = round(price * (1 - STOP_LOSS_PCT), 2)  if action == "buy"  else round(price * (1 + STOP_LOSS_PCT), 2)
-        take_profit = round(price * (1 + TAKE_PROFIT_PCT), 2) if action == "buy" else round(price * (1 - TAKE_PROFIT_PCT), 2)
-
-        payload = {
-            "action":      action,
-            "symbol":      SYMBOL,
-            "price":       str(price),
-            "rsi":         str(rsi_val),
-            "strategy":    "SCALPING_5X",
-            "timeframe":   "1m",
-            "reasons":     ", ".join(reasons),
-            "stop_loss":   str(stop_loss),
-            "take_profit": str(take_profit)
-        }
+        sl = round(price*(1-STOP_LOSS_PCT),2) if action=="buy" else round(price*(1+STOP_LOSS_PCT),2)
+        tp = round(price*(1+TAKE_PROFIT_PCT),2) if action=="buy" else round(price*(1-TAKE_PROFIT_PCT),2)
 
         res = requests.post(
             f"{BOT_URL}/webhook",
-            json=payload,
-            headers={
-                "Content-Type":    "application/json",
-                "x-webhook-secret": BOT_SECRET
-            },
+            json={"action":action,"symbol":SYMBOL,"price":str(price),
+                  "rsi":str(rsi_val),"strategy":"SCALPING_5X","timeframe":"1m",
+                  "reasons":", ".join(reasons),"stop_loss":str(sl),"take_profit":str(tp)},
+            headers={"Content-Type":"application/json","x-webhook-secret":BOT_SECRET},
             timeout=30
         )
-
         result = res.json()
-        trade_stats["total_signals"] += 1
-        trade_stats["last_signal"]   = action
-        trade_stats["last_signal_time"] = datetime.now().isoformat()
-
-        if action == "buy":
-            trade_stats["buy_signals"] += 1
-        else:
-            trade_stats["sell_signals"] += 1
-
+        trade_stats["total"]+=1
+        trade_stats["last_signal"]=action
+        trade_stats["last_time"]=time.time()
+        if action=="buy": trade_stats["buys"]+=1
+        else: trade_stats["sells"]+=1
         logger.info(f"Bot response: {result}")
         return result
-
     except Exception as e:
         logger.error(f"Send error: {e}")
         return None
 
 # ================================================================
-# ANTI-SPAM — Same signal bar bar nahi
-# ================================================================
-last_action    = None
-last_action_time = 0
-COOLDOWN_SECONDS = 300   # 5 minute cooldown same signal ke liye
-
-# ================================================================
-# MAIN LOOP
+# MAIN
 # ================================================================
 def main():
-    global last_action, last_action_time
-
-    logger.info("=" * 55)
-    logger.info("BTC SCALPING BOT - ULTRA AGGRESSIVE")
-    logger.info(f"Bot URL:    {BOT_URL}")
+    logger.info("="*55)
+    logger.info("BTC SCALPING BOT - ULTRA AGGRESSIVE (FIXED)")
+    logger.info(f"Bot:        {BOT_URL}")
     logger.info(f"Symbol:     {SYMBOL}")
-    logger.info(f"Check:      Har {CHECK_SECONDS} second")
-    logger.info(f"Stop Loss:  {STOP_LOSS_PCT*100}%")
-    logger.info(f"Take Profit:{TAKE_PROFIT_PCT*100}%")
-    logger.info(f"Min Signals:{MIN_CONFIDENCE}/5 strategies")
-    logger.info("=" * 55)
+    logger.info(f"Check:      Har {CHECK_SECONDS}s")
+    logger.info(f"SL/TP:      {STOP_LOSS_PCT*100}% / {TAKE_PROFIT_PCT*100}%")
+    logger.info(f"Min Signals:{MIN_CONFIDENCE}/5")
+    logger.info("="*55)
 
-    iteration = 0
-
+    iteration=0
     while True:
-        iteration += 1
-        now = datetime.now().strftime("%H:%M:%S")
-
+        iteration+=1
         try:
-            logger.info(f"\n{'='*40}")
-            logger.info(f"[#{iteration}] [{now}] BTC Check kar raha hoon...")
+            logger.info(f"\n--- #{iteration} [{datetime.now().strftime('%H:%M:%S')}] ---")
+            price = get_btc_price()
+            if not price:
+                time.sleep(30); continue
 
-            # Data lo
-            ohlcv = get_btc_data()
-            if not ohlcv:
-                logger.warning("Data nahi mila — 30 sec wait")
-                time.sleep(30)
-                continue
+            prices.append(price)
+            action, rsi_val, current, reasons = analyze(prices)
 
-            # Signal analyze karo
-            action, rsi_val, price, reasons = analyze_scalp_signal(ohlcv)
-
-            if action and action != "hold":
+            if action != "hold":
                 now_ts = time.time()
-                cooldown_ok = (
-                    last_action != action or
-                    (now_ts - last_action_time) > COOLDOWN_SECONDS
-                )
-
-                if cooldown_ok:
-                    logger.info(f"SCALP SIGNAL: {action.upper()} @ ${price:,.2f}")
-                    logger.info(f"Reasons: {', '.join(reasons)}")
-
-                    result = send_signal(action, price, rsi_val, reasons)
-
-                    if result:
-                        last_action      = action
-                        last_action_time = now_ts
-                        logger.info(f"Signal bhej diya: {action.upper()} @ ${price:,.2f}")
+                if trade_stats["last_signal"]!=action or (now_ts-trade_stats["last_time"])>COOLDOWN:
+                    logger.info(f"SIGNAL: {action.upper()} @ ${current:,.2f} | {', '.join(reasons)}")
+                    send_signal(action, current, rsi_val, reasons)
                 else:
-                    remaining = int(COOLDOWN_SECONDS - (now_ts - last_action_time))
-                    logger.info(f"Cooldown: {remaining}s baaki ({action} recently hua)")
-
+                    left=int(COOLDOWN-(now_ts-trade_stats["last_time"]))
+                    logger.info(f"Cooldown: {left}s baaki")
             else:
-                logger.info(f"HOLD | Price: ${price:,.2f} | RSI: {rsi_val}")
+                logger.info(f"HOLD | ${current:,.2f} | RSI:{rsi_val}")
 
-            # Stats har 10 iteration pe
-            if iteration % 10 == 0:
-                logger.info(f"\nSTATS: Total={trade_stats['total_signals']} | BUY={trade_stats['buy_signals']} | SELL={trade_stats['sell_signals']}")
+            if iteration%10==0:
+                logger.info(f"STATS: Total={trade_stats['total']} BUY={trade_stats['buys']} SELL={trade_stats['sells']}")
 
             time.sleep(CHECK_SECONDS)
 
         except KeyboardInterrupt:
-            logger.info("\nBot band kar diya")
-            logger.info(f"Final Stats: {trade_stats}")
+            logger.info("Band ho raha hai...")
             break
         except Exception as e:
-            logger.error(f"Loop error: {e}")
+            logger.error(f"Error: {e}")
             time.sleep(30)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
